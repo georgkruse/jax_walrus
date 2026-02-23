@@ -341,6 +341,7 @@ class IsotropicModel(nn.Module):
     encoder_groups: int = 16
     jitter_patches: bool = True
     learned_pad: bool = True
+    remat: bool = True
 
     def _make_encoder(self, name, field_indices, x_flat, stride1, stride2):
         """Instantiate and call the encoder."""
@@ -396,25 +397,45 @@ class IsotropicModel(nn.Module):
         """
         Forward pass.
 
+        Accepts **channels-last** input with batch-first layout::
+
+            x: (B, T, H, [W, [D]], C)
+
+        Internally converts to the native ``(T, B, C, H, W, D)`` layout,
+        runs the model, and converts the output back to channels-last::
+
+            output: (B, T_out, H, [W, [D]], C_out)
+
         Args:
-            x: (T, B, C, H, [W, [D]]) -- input fields.
-            state_labels: (C_out,) -- output channel indices for the decoder.
-            bcs: boundary conditions per spatial dim, each ``[bc_left, bc_right]``.
+            x: Input fields in channels-last format ``(B, T, H, [W, [D]], C)``.
+            state_labels: ``(C_out,)`` — output channel indices for the decoder.
+            bcs: Boundary conditions per spatial dim, each ``[bc_left, bc_right]``.
                 Use ``2`` for periodic, ``0`` for open.
-            stride1: first encoder conv stride.  Auto-computed if None.
-            stride2: second encoder conv stride.  Auto-computed if None.
-            field_indices: SpaceBag channel indices.  Auto-built if None.
-            dim_key: encoder/decoder variant (2 or 3).  Auto-detected if None.
-            deterministic: True for inference, False for training.
+            stride1: First encoder conv stride.  Auto-computed if ``None``.
+            stride2: Second encoder conv stride.  Auto-computed if ``None``.
+            field_indices: SpaceBag channel indices.  Auto-built if ``None``.
+            dim_key: Encoder/decoder variant (2 or 3).  Auto-detected if ``None``.
+            deterministic: ``True`` for inference, ``False`` for training.
 
         Returns:
-            ``(T, B, C_out, ...)`` for causal, ``(1, B, C_out, ...)`` for non-causal.
+            ``(B, T_out, ..., C_out)`` channels-last output.
         """
+        # ── Convert (B, T, *spatial, C) → (T, B, C, *spatial) ──
+        # x arrives as channels-last: (B, T, H, [W, [D]], C)
+        n_spatial = x.ndim - 3  # total dims minus B, T, C
+        # Move B,T to front and C from last to third position
+        x = jnp.moveaxis(x, -1, 2)  # (B, T, C, *spatial)
+        x = jnp.swapaxes(x, 0, 1)  # (T, B, C, *spatial)
+
         # ── Pad to max_d spatial dims ──
         squeeze_out = 0
         while x.ndim - 3 < self.max_d:
             x = jnp.expand_dims(x, axis=-1)
             squeeze_out += 1
+
+        # Ensure state_labels is a proper array (callers may pass a tuple
+        # to avoid the equinox "JAX array set as static" warning).
+        state_labels = jnp.asarray(state_labels, dtype=jnp.int32)
 
         T, B, C = x.shape[:3]
         x_shape = x.shape[3:]
@@ -486,7 +507,10 @@ class IsotropicModel(nn.Module):
         x_enc = rearrange(x_enc, "(T B) ... -> T B ...", T=T)
 
         # ── Process ──
-        dp = jnp.linspace(0, self.drop_path, self.processor_blocks)
+        # Compute drop-path rates as plain Python floats to avoid
+        # ConcretizationTypeError when called inside a JIT context.
+        dp = [i * self.drop_path / max(self.processor_blocks - 1, 1)
+              for i in range(self.processor_blocks)]
         x_proc = x_enc
 
         bcs_flat = bcs[0] if isinstance(bcs, tuple) else bcs
@@ -514,15 +538,24 @@ class IsotropicModel(nn.Module):
                     roll_total[dim_idx] += rq
                     x_proc = jnp.roll(x_proc, rq, axis=periodic_dims[dim_idx])
 
-            x_proc, _ = SpaceTimeSplitBlock(
+            # Optionally wrap each processor block with gradient
+            # checkpointing (nn.remat) to trade compute for memory.
+            # static_argnums=(2,3,4) marks bcs, return_att, deterministic
+            # as static (Flax offsets user indices by +1 for self).
+            BlockCls = (
+                nn.remat(SpaceTimeSplitBlock, static_argnums=(2, 3, 4))
+                if self.remat
+                else SpaceTimeSplitBlock
+            )
+            x_proc, _ = BlockCls(
                 hidden_dim=self.hidden_dim,
                 num_heads=self.num_heads,
                 mlp_dim=self.mlp_dim,
-                drop_path=float(dp[i]),
+                drop_path=dp[i],
                 causal_in_time=self.causal_in_time,
                 bias_type=self.bias_type,
                 name=f"blocks_{i}",
-            )(x_proc, bcs=bcs, return_att=False, deterministic=deterministic)
+            )(x_proc, bcs, False, deterministic)
 
         # Undo accumulated periodic rolling
         if not deterministic and sum(roll_total) > 0 and self.jitter_patches:
@@ -553,5 +586,9 @@ class IsotropicModel(nn.Module):
         # Remove padded singleton spatial dims
         for _ in range(squeeze_out):
             x_dec = x_dec[..., 0]
+
+        # ── Convert (T, B, C, *spatial) → (B, T, *spatial, C) ──
+        x_dec = jnp.swapaxes(x_dec, 0, 1)  # (B, T, C, *spatial)
+        x_dec = jnp.moveaxis(x_dec, 2, -1)  # (B, T, *spatial, C)
 
         return x_dec

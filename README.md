@@ -282,4 +282,4 @@ The block-level differences arise from floating-point accumulation across the la
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

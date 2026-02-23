@@ -7,6 +7,7 @@ readme = "README.md"
 authors = [{ name = "Leon Armbruster", email = "leonarmbruster@iisb.fraunhofer.de" }]
 
 license = {text = "MIT"}
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "einops>=0.8",
