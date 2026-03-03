@@ -7,6 +7,14 @@ maintaining exact weight compatibility for pretrained checkpoint conversion.
 Reference:
     Bodner et al., "Aurora: A Foundation Model of the Atmosphere" (2024)
     https://github.com/PolymathicAI/the_well
+
+.. note::
+    This package is designed to be used with jNO
+    (https://github.com/FhG-IISB/jNO).
+
+.. warning::
+    This is a research-level repository. It may contain bugs and is subject
+    to continuous change without notice.
 """
 
 from importlib.metadata import version, PackageNotFoundError

@@ -1,5 +1,9 @@
 # Walrus-JAX
 
+> **Note:** This package is designed to be used with [jNO](https://github.com/armbrusl/jNO).
+
+> **Warning:** This is a research-level repository. It may contain bugs and is subject to continuous change without notice.
+
 A JAX/Flax translation of the [Walrus](https://github.com/PolymathicAI/the_well) PDE foundation model, maintaining exact 1-to-1 weight compatibility with the original PyTorch implementation for pretrained checkpoint conversion.
 
 ## Overview
