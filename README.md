@@ -77,17 +77,56 @@ uv pip install -e ".[test]"
 
 ## Weight Conversion
 
-Convert a pretrained PyTorch checkpoint to JAX msgpack format:
+The repository now includes a simple end-to-end workflow script at [scripts/main.py](scripts/main.py) that:
+
+1. downloads the pretrained `walrus.pt` checkpoint from Hugging Face,
+2. stores it in a local `models/` directory,
+3. converts it to JAX `.msgpack` format,
+4. skips downloading or conversion when the target files already exist,
+5. runs a direct equivalence check between the converted JAX parameters and the saved msgpack file.
+
+### Download, Convert, and Test with `main.py`
+
+Run the full workflow:
 
 ```bash
-python scripts/convert_pretrained.py --input walrus.pt --output jax_walrus.msgpack
+python scripts/main.py
 ```
 
-The script:
-1. Loads the PyTorch checkpoint (`ckpt['app']['model']` format)
-2. Maps all 857 parameters to the Flax parameter tree
-3. Validates that every PyTorch key is mapped
-4. Saves as msgpack with roundtrip verification
+By default, this creates or reuses:
+
+- `models/walrus.pt`
+- `models/walrus.msgpack`
+
+If the PyTorch checkpoint already exists, downloading is skipped. If the msgpack file already exists, conversion is skipped. The comparison step still runs so you can verify the saved file matches the converted parameters.
+
+To force a fresh download or reconversion:
+
+```bash
+python scripts/main.py --force-download
+python scripts/main.py --force-convert
+```
+
+To use a custom directory or a different processor-block count:
+
+```bash
+python scripts/main.py --models-dir /path/to/models
+python scripts/main.py --processor-blocks 40
+```
+
+### Direct Conversion with `convert.py`
+
+If you already have a local Walrus checkpoint and only want the raw conversion step, you can still use [scripts/convert.py](scripts/convert.py):
+
+```bash
+python scripts/convert.py --input /path/to/walrus.pt --output /path/to/walrus.msgpack
+```
+
+That script:
+1. loads the PyTorch checkpoint (`ckpt['app']['model']` format),
+2. maps all parameters to the Flax parameter tree,
+3. validates the mapping coverage,
+4. saves as msgpack with roundtrip verification.
 
 ### Weight Mapping Rules
 
@@ -157,30 +196,6 @@ from jax_walrus.processor import SpaceTimeSplitBlock
 from jax_walrus.spatial_attention import FullAttention
 from jax_walrus.temporal_attention import AxialTimeAttention
 from jax_walrus.normalization import RMSGroupNorm
-```
-
-## Project Structure
-
-```
-jax_walrus/
-├── jax_walrus/              # Core library
-│   ├── __init__.py          # Exports IsotropicModel
-│   ├── model.py             # IsotropicModel (top-level)
-│   ├── encoder.py           # AdaptiveDVstride + SpaceBag encoders
-│   ├── decoder.py           # AdaptiveDVstride decoder with periodic BCs
-│   ├── processor.py         # SpaceTimeSplitBlock
-│   ├── spatial_attention.py # FullAttention (SwiGLU, RoPE, QK-norm)
-│   ├── temporal_attention.py# AxialTimeAttention (rel-pos bias, causal)
-│   ├── normalization.py     # RMSGroupNorm
-│   ├── rope.py              # Rotary embeddings (lucidrains + simple)
-│   └── convert_weights.py   # PyTorch → Flax param mapping
-├── scripts/
-│   └── convert_pretrained.py# CLI weight conversion script
-├── tests/
-│   └── test_equivalence.py  # Component-level PT vs JAX tests
-├── pyproject.toml
-├── .gitignore
-└── README.md
 ```
 
 ## Module Details

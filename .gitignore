@@ -23,6 +23,7 @@ env/
 Thumbs.db
 
 # Model weights
+models/
 *.pt
 *.ckpt
 *.msgpack

@@ -2,31 +2,24 @@
 Pretrained weight equivalence test: verify that the JAX model with converted
 weights produces the same output as the PyTorch model with original weights.
 
-Modified to work with the CE-RM (Compressible Euler Richtmyer-Meshkov) dataset.
-
-Dataset info:
-- Shape: (1260, 21, 5, 128, 128) = (trajectories, time, channels, x, y)
-- Channels: density, horizontal velocity, vertical velocity, pressure, passive tracer
-- Domain: unit square, T=2
-- Split: 1030/100/130 (train/val/test)
+Modified to work with deterministic synthetic inputs instead of a dataset.
 
 Usage:
     python compare.py
 """
 
+import argparse
 import sys
-import os
 import time
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
-import xarray as xr
 
 import jax
 import jax.numpy as jnp
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
@@ -35,14 +28,10 @@ jax.config.update("jax_platform_name", "cpu")
 
 # ── Resolve paths ──
 
-WALRUS_ROOT = Path("/home/users/armbrust/walrus")
-WALRUS_PT = Path("/home/users/armbrust/projects/DATA/walrus/walrus.pt")
-jax_walrus_MSGPACK = Path(
-    "/home/users/armbrust/projects/DATA/walrus/jax_walrus.msgpack"
-)
-CE_RM_PATH = Path("/home/users/armbrust/projects/DATA/CE-RM/CE-RM.nc")
-
-sys.path.insert(0, str(WALRUS_ROOT))
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_WALRUS_PT = PROJECT_ROOT / "models" / "walrus.pt"
+DEFAULT_JAX_WALRUS_MSGPACK = PROJECT_ROOT / "models" / "walrus.msgpack"
 
 # ── Mock the_well ──
 
@@ -70,111 +59,193 @@ sys.modules.setdefault("the_well", _well_mod)
 sys.modules.setdefault("the_well.data", _data_mod)
 sys.modules.setdefault("the_well.data.datasets", _ds_mod)
 
-# ── Imports ──
-
-from walrus.models.encoders.vstride_encoder import (
-    SpaceBagAdaptiveDVstrideEncoder as TorchSpaceBagEncoder,
-)
-from walrus.models.decoders.vstride_decoder import (
-    AdaptiveDVstrideDecoder as TorchAdaptiveDecoder,
-)
-from walrus.models.spatiotemporal_blocks.space_time_split import (
-    SpaceTimeSplitBlock as TorchBlock,
-)
-from walrus.models.spatial_blocks.full_attention import (
-    FullAttention as TorchFullAttn,
-)
-from walrus.models.temporal_blocks.axial_time_attention import (
-    AxialTimeAttention as TorchAxialTime,
-)
-from walrus.models.shared_utils.normalization import (
-    RMSGroupNorm as TorchRMSGroupNorm,
-)
-from jax_walrus.model import IsotropicModel as JaxIsotropicModel
-from jax_walrus.convert_weights import (
-    load_pytorch_state_dict,
-    torch_to_numpy,
-)
-
-from einops import rearrange
-
 np.random.seed(0)
 torch.manual_seed(0)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compare local Walrus PyTorch and JAX checkpoints on synthetic inputs"
+    )
+    parser.add_argument(
+        "--walrus-root",
+        type=Path,
+        required=True,
+        help="Path to the local Walrus repository",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=DEFAULT_WALRUS_PT,
+        help="Path to walrus.pt",
+    )
+    parser.add_argument(
+        "--msgpack-path",
+        type=Path,
+        default=DEFAULT_JAX_WALRUS_MSGPACK,
+        help="Path to walrus.msgpack",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed used for deterministic synthetic input generation",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=1,
+        help="Batch size for synthetic inputs",
+    )
+    parser.add_argument(
+        "--num-timesteps",
+        type=int,
+        default=2,
+        help="Number of timesteps for synthetic inputs",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=128,
+        help="Synthetic input height",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=128,
+        help="Synthetic input width",
+    )
+    parser.add_argument(
+        "--target-depth",
+        type=int,
+        default=32,
+        help="Depth dimension used after tiling 2D synthetic data to 3D",
+    )
+    return parser.parse_args()
+
+
+def import_walrus_modules(walrus_root: Path):
+    sys.path.insert(0, str(walrus_root))
+
+    from walrus.models.encoders.vstride_encoder import (
+        SpaceBagAdaptiveDVstrideEncoder as TorchSpaceBagEncoder,
+    )
+    from walrus.models.decoders.vstride_decoder import (
+        AdaptiveDVstrideDecoder as TorchAdaptiveDecoder,
+    )
+    from walrus.models.spatiotemporal_blocks.space_time_split import (
+        SpaceTimeSplitBlock as TorchBlock,
+    )
+    from walrus.models.spatial_blocks.full_attention import (
+        FullAttention as TorchFullAttn,
+    )
+    from walrus.models.temporal_blocks.axial_time_attention import (
+        AxialTimeAttention as TorchAxialTime,
+    )
+    from walrus.models.shared_utils.normalization import (
+        RMSGroupNorm as TorchRMSGroupNorm,
+    )
+
+    return {
+        "TorchSpaceBagEncoder": TorchSpaceBagEncoder,
+        "TorchAdaptiveDecoder": TorchAdaptiveDecoder,
+        "TorchBlock": TorchBlock,
+        "TorchFullAttn": TorchFullAttn,
+        "TorchAxialTime": TorchAxialTime,
+        "TorchRMSGroupNorm": TorchRMSGroupNorm,
+    }
+
+
+def import_jax_walrus_modules(project_root: Path):
+    sys.path.insert(0, str(project_root))
+
+    from jax_walrus.model import IsotropicModel as JaxIsotropicModel
+    from jax_walrus.convert_weights import (
+        convert_pytorch_to_jax_params,
+        load_pytorch_state_dict,
+        torch_to_numpy,
+    )
+
+    return {
+        "JaxIsotropicModel": JaxIsotropicModel,
+        "convert_pytorch_to_jax_params": convert_pytorch_to_jax_params,
+        "load_pytorch_state_dict": load_pytorch_state_dict,
+        "torch_to_numpy": torch_to_numpy,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# CE-RM Dataset Loading
+# Synthetic Input Generation
 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def load_ce_rm_dataset(path, split="test", num_samples=1, num_timesteps=2):
+def generate_synthetic_input(
+    num_samples=1,
+    num_timesteps=2,
+    num_channels=5,
+    height=128,
+    width=128,
+    seed=0,
+):
     """
-    Load the CE-RM dataset from NetCDF file.
+    Generate deterministic smooth 2D synthetic fields.
 
     Args:
-        path: Path to the CE-RM.nc file
-        split: 'train', 'val', or 'test'
-        num_samples: Number of trajectories to load
-        num_timesteps: Number of timesteps to use
+        num_samples: Batch size
+        num_timesteps: Number of timesteps
+        num_channels: Number of physical channels
+        height: Spatial height
+        width: Spatial width
+        seed: Random seed
 
     Returns:
         data: numpy array of shape (T, B, C, H, W)
-        metadata: dict with dataset info
+        metadata: dict with synthetic input info
     """
-    print(f"\nLoading CE-RM dataset from {path}...")
+    print("\nGenerating synthetic smooth input fields...")
+    rng = np.random.default_rng(seed)
 
-    ds = xr.open_dataset(path)
-    solution = ds["solution"].values  # Shape: (1260, 21, 5, 128, 128)
+    x = np.linspace(0.0, 2.0 * np.pi, width, dtype=np.float32)
+    y = np.linspace(0.0, 2.0 * np.pi, height, dtype=np.float32)
+    xx, yy = np.meshgrid(x, y)
 
-    print(f"  Full dataset shape: {solution.shape}")
-    print(f"  (trajectories, timesteps, channels, H, W)")
+    data = np.zeros(
+        (num_timesteps, num_samples, num_channels, height, width), dtype=np.float32
+    )
 
-    # Define splits
-    train_end = 1030
-    val_end = 1130
+    for t in range(num_timesteps):
+        time_phase = 2.0 * np.pi * t / max(num_timesteps, 1)
+        for b in range(num_samples):
+            for c in range(num_channels):
+                field = np.zeros((height, width), dtype=np.float32)
+                for _ in range(4):
+                    kx = rng.integers(1, 5)
+                    ky = rng.integers(1, 5)
+                    amplitude = rng.uniform(0.5, 1.5)
+                    phase = rng.uniform(0.0, 2.0 * np.pi)
+                    field += amplitude * np.sin(kx * xx + phase + time_phase)
+                    field += 0.5 * amplitude * np.cos(ky * yy - phase + 0.5 * time_phase)
+                data[t, b, c] = field
 
-    if split == "train":
-        data = solution[:train_end]
-        split_info = f"train [0:{train_end}]"
-    elif split == "val":
-        data = solution[train_end:val_end]
-        split_info = f"val [{train_end}:{val_end}]"
-    elif split == "test":
-        data = solution[val_end:]
-        split_info = f"test [{val_end}:]"
-    else:
-        raise ValueError(f"Unknown split: {split}")
-
-    print(f"  Using {split_info}: {data.shape[0]} trajectories")
-
-    # Select samples and timesteps
-    data = data[:num_samples, :num_timesteps]
-
-    # Rearrange from (B, T, C, H, W) to (T, B, C, H, W)
-    data = np.transpose(data, (1, 0, 2, 3, 4))
-
-    # Compute per-channel statistics for normalization
     mean = data.mean(axis=(0, 1, 3, 4), keepdims=True)
     std = data.std(axis=(0, 1, 3, 4), keepdims=True)
     std = np.where(std < 1e-8, 1.0, std)
     data_normalized = (data - mean) / std
 
     metadata = {
-        "split": split,
+        "kind": "synthetic",
         "num_samples": num_samples,
         "num_timesteps": num_timesteps,
-        "original_shape": solution.shape,
+        "original_shape": data.shape,
         "channels": ["density", "u_x", "u_y", "pressure", "tracer"],
         "mean": mean.squeeze(),
         "std": std.squeeze(),
-        "domain": "unit square [0,1]²",
-        "T_max": 2.0,
-        "spatial_resolution": (128, 128),
+        "domain": "unit square [0,1]^2",
+        "spatial_resolution": (height, width),
+        "seed": seed,
     }
-
-    ds.close()
 
     print(f"  Selected data shape: {data.shape} (T, B, C, H, W)")
     print(f"  Channels: {metadata['channels']}")
@@ -247,6 +318,18 @@ def add_coordinate_channels(data_3d):
     return data_with_coords
 
 
+def pytorch_to_jax_layout(x):
+    """Convert (T, B, C, H, W, D) to JAX input layout (B, T, H, W, D, C)."""
+    x = np.swapaxes(x, 0, 1)
+    return np.moveaxis(x, 2, -1)
+
+
+def jax_to_pytorch_layout(x):
+    """Convert JAX output layout (B, T, H, W, D, C) to (T, B, C, H, W, D)."""
+    x = np.moveaxis(x, -1, 2)
+    return np.swapaxes(x, 0, 1)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Comparison Utilities
@@ -255,6 +338,8 @@ def add_coordinate_channels(data_3d):
 
 
 def assert_close(name, torch_out, jax_out, atol=5e-3, rtol=5e-3):
+    from jax_walrus.convert_weights import torch_to_numpy
+
     t_np = torch_to_numpy(torch_out)
     j_np = np.asarray(jax_out)
     max_diff = np.max(np.abs(t_np - j_np))
@@ -275,9 +360,9 @@ def assert_close(name, torch_out, jax_out, atol=5e-3, rtol=5e-3):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def visualize_ce_rm_input(data, metadata, save_path="ce_rm_input.png"):
+def visualize_input(data, metadata, save_path="synthetic_input.png"):
     """
-    Visualize the CE-RM input data.
+    Visualize the synthetic input data.
     """
     # Handle 3D data by taking middle slice
     if len(data.shape) == 6:
@@ -312,7 +397,7 @@ def visualize_ce_rm_input(data, metadata, save_path="ce_rm_input.png"):
                 ax.set_xlabel("x")
 
     fig.suptitle(
-        f"CE-RM Dataset Input ({metadata['split']} split)\n"
+        f"Synthetic Input\n"
         f"Shape: {data.shape}, Domain: {metadata['domain']}",
         fontsize=12,
         fontweight="bold",
@@ -329,6 +414,8 @@ def visualize_comparison(
     """
     Visualize PyTorch vs JAX output comparison.
     """
+    from jax_walrus.convert_weights import torch_to_numpy
+
     t_np = torch_to_numpy(torch_out)
     j_np = np.asarray(jax_out)
     diff = t_np - j_np
@@ -450,6 +537,8 @@ def visualize_3d_slices(torch_out, jax_out, save_path="output_3d_slices.png"):
     """
     Visualize 3D output with slices along all axes.
     """
+    from jax_walrus.convert_weights import torch_to_numpy
+
     t_np = torch_to_numpy(torch_out)
     j_np = np.asarray(jax_out)
 
@@ -536,6 +625,8 @@ def visualize_channel_statistics(
     """
     Per-channel statistics comparison.
     """
+    from jax_walrus.convert_weights import torch_to_numpy
+
     t_np = torch_to_numpy(torch_out)
     j_np = np.asarray(jax_out)
 
@@ -609,8 +700,28 @@ def visualize_channel_statistics(
 
 
 def main():
+    args = parse_args()
+
+    if not args.walrus_root.exists():
+        raise FileNotFoundError(f"Walrus repository not found: {args.walrus_root}")
+    if not args.checkpoint_path.exists():
+        raise FileNotFoundError(f"Walrus checkpoint not found: {args.checkpoint_path}")
+    if not args.msgpack_path.exists():
+        raise FileNotFoundError(f"JAX msgpack not found: {args.msgpack_path}")
+    walrus_modules = import_walrus_modules(args.walrus_root)
+    jax_walrus_modules = import_jax_walrus_modules(PROJECT_ROOT)
+    TorchSpaceBagEncoder = walrus_modules["TorchSpaceBagEncoder"]
+    TorchAdaptiveDecoder = walrus_modules["TorchAdaptiveDecoder"]
+    TorchBlock = walrus_modules["TorchBlock"]
+    TorchFullAttn = walrus_modules["TorchFullAttn"]
+    TorchAxialTime = walrus_modules["TorchAxialTime"]
+    TorchRMSGroupNorm = walrus_modules["TorchRMSGroupNorm"]
+    JaxIsotropicModel = jax_walrus_modules["JaxIsotropicModel"]
+    convert_pytorch_to_jax_params = jax_walrus_modules["convert_pytorch_to_jax_params"]
+    load_pytorch_state_dict = jax_walrus_modules["load_pytorch_state_dict"]
+
     print("=" * 70)
-    print("CE-RM Dataset: PyTorch vs JAX Model Comparison")
+    print("Synthetic Input: PyTorch vs JAX Model Comparison")
     print("=" * 70)
 
     # ═══════════════════════════════════════════════════════════════════
@@ -630,9 +741,9 @@ def main():
     extra_dims = 3
 
     # Dataset config
-    NUM_SAMPLES = 1
-    NUM_TIMESTEPS = 2
-    TARGET_DEPTH = 32  # For 2D->3D conversion
+    NUM_SAMPLES = args.num_samples
+    NUM_TIMESTEPS = args.num_timesteps
+    TARGET_DEPTH = args.target_depth
 
     stride1 = (8, 8, 8)
     stride2 = (4, 4, 4)
@@ -643,11 +754,20 @@ def main():
     # Step 1: Load CE-RM Dataset
     # ═══════════════════════════════════════════════════════════════════
     print("\n" + "=" * 70)
-    print("Step 1: Loading CE-RM Dataset")
+    print("Step 1: Generating Synthetic Input")
     print("=" * 70)
 
-    data_2d, metadata = load_ce_rm_dataset(
-        CE_RM_PATH, split="test", num_samples=NUM_SAMPLES, num_timesteps=NUM_TIMESTEPS
+    print(f"  Walrus repo: {args.walrus_root}")
+    print(f"  PyTorch checkpoint: {args.checkpoint_path}")
+    print(f"  JAX msgpack: {args.msgpack_path}")
+    print(f"  Seed: {args.seed}")
+
+    data_2d, metadata = generate_synthetic_input(
+        num_samples=NUM_SAMPLES,
+        num_timesteps=NUM_TIMESTEPS,
+        height=args.height,
+        width=args.width,
+        seed=args.seed,
     )
 
     # Convert to 3D
@@ -659,7 +779,7 @@ def main():
     x_np = add_coordinate_channels(data_3d)
 
     # Visualize input
-    visualize_ce_rm_input(data_3d, metadata, save_path="ce_rm_input.png")
+    visualize_input(data_3d, metadata, save_path="synthetic_input.png")
 
     # Setup field indices
     # CE-RM has 5 physical channels
@@ -674,6 +794,9 @@ def main():
     print(f"  State labels: {state_labels_np}")
     print(f"  Field indices: {field_indices_np}")
 
+    x_jax = pytorch_to_jax_layout(x_np)
+    print(f"  JAX input shape: {x_jax.shape}")
+
     # ═══════════════════════════════════════════════════════════════════
     # Step 2: Load PyTorch Checkpoint
     # ═══════════════════════════════════════════════════════════════════
@@ -682,7 +805,7 @@ def main():
     print("=" * 70)
 
     t0 = time.time()
-    sd = load_pytorch_state_dict(WALRUS_PT)
+    sd = load_pytorch_state_dict(str(args.checkpoint_path))
     print(f"  Loaded {len(sd)} parameters in {time.time() - t0:.1f}s")
 
     encoder_dummy_val = sd["encoder_dummy"].numpy()
@@ -778,7 +901,6 @@ def main():
 
     t0 = time.time()
     from flax.serialization import from_bytes
-    from jax_walrus.convert_weights import convert_pytorch_to_jax_params
 
     target = convert_pytorch_to_jax_params(sd, processor_blocks=40, dim_keys=[2, 3])
 
@@ -789,7 +911,7 @@ def main():
 
     target_jnp = {"params": to_jax_arrays(target["params"])}
 
-    with open(jax_walrus_MSGPACK, "rb") as f:
+    with open(args.msgpack_path, "rb") as f:
         jax_params = from_bytes(target_jnp, f.read())
     print(f"  Loaded JAX params in {time.time() - t0:.1f}s")
 
@@ -906,7 +1028,7 @@ def main():
 
     jax_out = jax_model.apply(
         jax_params,
-        jnp.array(x_np),
+        jnp.array(x_jax),
         jnp.array(state_labels_np),
         bcs,
         stride1=stride1,
@@ -914,6 +1036,8 @@ def main():
         field_indices=jnp.array(field_indices_np),
         dim_key=3,
     )
+
+    jax_out = jax_to_pytorch_layout(np.asarray(jax_out))
 
     jax_time = time.time() - t0
     print(f"  JAX output: {jax_out.shape}")
@@ -956,10 +1080,11 @@ def main():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"  Dataset:              CE-RM (Compressible Euler Richtmyer-Meshkov)")
+    print(f"  Dataset:              Synthetic smooth fields")
     print(f"  Input shape:          {x_np.shape}")
     print(f"  Output shape:         {torch_out.shape}")
     print(f"  Channels:             {metadata['channels']}")
+    print(f"  Seed:                 {metadata['seed']}")
     print(f"  Max absolute diff:    {max_diff:.2e}")
     print(f"  Mean absolute diff:   {mean_diff:.2e}")
     print(f"  Mean relative diff:   {rel_diff:.2e}")
@@ -970,7 +1095,7 @@ def main():
     if passed:
         print("\n✓ SUCCESS: JAX model matches PyTorch model!")
         print("\nVisualization files saved:")
-        print("  - ce_rm_input.png")
+        print("  - synthetic_input.png")
         print("  - output_comparison.png")
         print("  - output_3d_slices.png")
         print("  - channel_stats.png")
